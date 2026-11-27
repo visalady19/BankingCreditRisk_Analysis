@@ -1,0 +1,182 @@
+-- Credit Risk & Default Analysis - DAX
+-- Table in Power BI: 'public master_credit_risk'
+
+
+-- =========================
+-- Calculated columns
+-- =========================
+
+-- Page 1 segments
+DTI Segment =
+SWITCH(TRUE(),
+    'public master_credit_risk'[dti_ratio_pct] < 15, "1. Low (< 15%)",
+    'public master_credit_risk'[dti_ratio_pct] <= 25, "2. Moderate (15% - 25%)",
+    'public master_credit_risk'[dti_ratio_pct] <= 35, "3. High (25% - 35%)",
+    "4. Very High (> 35%)"
+)
+
+Payment Behavior =
+SWITCH(TRUE(),
+    ISBLANK('public master_credit_risk'[late_payments_count]) || 'public master_credit_risk'[total_installments] = 0, "1. New Customer (No History)",
+    'public master_credit_risk'[late_payments_count] = 0, "2. Disciplined (0 Late)",
+    'public master_credit_risk'[late_payments_count] <= 3, "3. Occasional Late (1-3x)",
+    "4. Frequent Late (> 3x)"
+)
+
+-- Page 2 buckets
+Refusal Bucket =
+VAR r = 'public master_credit_risk'[prev_refused_count]
+RETURN IF(r >= 5, "5+", FORMAT(r, "0"))
+
+External Loans Bucket =
+VAR n = 'public master_credit_risk'[active_external_loans]
+RETURN IF(n >= 8, "8+", FORMAT(n, "0"))
+
+-- Page 2 risk matrix flags
+Refusal Flag =
+IF('public master_credit_risk'[prev_refused_count] >= 2, "2+ Refusals", "0-1 Refusals")
+
+Bureau Flag =
+IF('public master_credit_risk'[active_external_loans] >= 5, "5+ Active Loans", "0-4 Active Loans")
+
+-- policy rules (1 = blocked)
+Old Rule Blocked =
+IF(
+    'public master_credit_risk'[dti_ratio_pct] > 25
+        && 'public master_credit_risk'[late_payments_count] > 3,
+    1, 0
+)
+
+New Rule Blocked =
+IF(
+    'public master_credit_risk'[prev_refused_count] >= 2
+        && 'public master_credit_risk'[active_external_loans] >= 5,
+    1, 0
+)
+
+
+-- =========================
+-- Calculated table
+-- =========================
+
+-- scenario list for the simulator (not related to the main table)
+Policy Scenario =
+DATATABLE(
+    "Scenario", STRING,
+    "Order", INTEGER,
+    {
+        {"Current Portfolio (No Rule)", 1},
+        {"Old Rule: DTI > 25% & Late > 3x", 2},
+        {"New Rule: 2+ Refusals & 5+ Bureau Loans", 3}
+    }
+)
+
+
+-- =========================
+-- Measures - Page 1
+-- =========================
+
+Total Applications = COUNTROWS('public master_credit_risk')
+
+Default Rate = DIVIDE(SUM('public master_credit_risk'[target]), [Total Applications], 0)
+
+Total Credit Disbursed = SUM('public master_credit_risk'[credit_amount])
+
+Defaulted Exposure =
+CALCULATE(SUM('public master_credit_risk'[credit_amount]), 'public master_credit_risk'[target] = 1)
+
+-- shown as "Defaulted Exposure Rate" (assumes 100% LGD)
+Loss Rate = DIVIDE([Defaulted Exposure], [Total Credit Disbursed], 0)
+
+Target Default Rate = 0.065
+
+Target Loss Rate = 0.05
+
+
+-- =========================
+-- Measures - Page 2 simulator
+-- =========================
+
+Blocked Applications =
+VAR s = SELECTEDVALUE('Policy Scenario'[Order], 1)
+RETURN
+SWITCH(s,
+    2, CALCULATE([Total Applications], 'public master_credit_risk'[Old Rule Blocked] = 1),
+    3, CALCULATE([Total Applications], 'public master_credit_risk'[New Rule Blocked] = 1),
+    0
+)
+
+Blocked Defaults =
+VAR s = SELECTEDVALUE('Policy Scenario'[Order], 1)
+RETURN
+SWITCH(s,
+    2, CALCULATE(SUM('public master_credit_risk'[target]), 'public master_credit_risk'[Old Rule Blocked] = 1),
+    3, CALCULATE(SUM('public master_credit_risk'[target]), 'public master_credit_risk'[New Rule Blocked] = 1),
+    0
+)
+
+Saved Credit Loss =
+VAR s = SELECTEDVALUE('Policy Scenario'[Order], 1)
+RETURN
+SWITCH(s,
+    2, CALCULATE([Defaulted Exposure], 'public master_credit_risk'[Old Rule Blocked] = 1),
+    3, CALCULATE([Defaulted Exposure], 'public master_credit_risk'[New Rule Blocked] = 1),
+    0
+)
+
+Saved Credit Loss (bn) = [Saved Credit Loss] / 1000000000
+
+Good Customers Rejected = [Blocked Applications] - [Blocked Defaults]
+
+Blocked Bad Rate = DIVIDE([Blocked Defaults], [Blocked Applications])
+
+Approval Rate = DIVIDE([Total Applications] - [Blocked Applications], [Total Applications])
+
+Simulated Default Rate =
+DIVIDE(
+    SUM('public master_credit_risk'[target]) - [Blocked Defaults],
+    [Total Applications] - [Blocked Applications]
+)
+
+Simulated Exposure Rate =
+VAR s = SELECTEDVALUE('Policy Scenario'[Order], 1)
+VAR BlockedDisbursed =
+    SWITCH(s,
+        2, CALCULATE([Total Credit Disbursed], 'public master_credit_risk'[Old Rule Blocked] = 1),
+        3, CALCULATE([Total Credit Disbursed], 'public master_credit_risk'[New Rule Blocked] = 1),
+        0
+    )
+RETURN
+DIVIDE([Defaulted Exposure] - [Saved Credit Loss], [Total Credit Disbursed] - BlockedDisbursed)
+
+
+-- =========================
+-- Measures - New Rule Impact cards
+-- =========================
+
+-- "before" labels
+Ref Default Rate = "Before: " & FORMAT([Default Rate], "0.00%")
+
+Ref Exposure Rate = "Before: " & FORMAT([Loss Rate], "0.00%")
+
+Ref Approval Rate = "Before: 100.00%"
+
+-- change vs before, with arrow
+Delta Default Rate =
+VAR d = ([Simulated Default Rate] - [Default Rate]) * 100
+RETURN IF(d < 0, "▼ ", "▲ ") & FORMAT(ABS(d), "0.00") & " pp"
+
+Delta Exposure Rate =
+VAR d = ([Simulated Exposure Rate] - [Loss Rate]) * 100
+RETURN IF(d < 0, "▼ ", "▲ ") & FORMAT(ABS(d), "0.00") & " pp"
+
+Delta Approval Rate =
+VAR d = ([Approval Rate] - 1) * 100
+RETURN IF(d < 0, "▼ ", "▲ ") & FORMAT(ABS(d), "0.00") & " pp"
+
+-- conditional colors: green = better, red = worse, amber = trade-off
+Color Default Rate = IF([Simulated Default Rate] < [Default Rate], "#2E8B57", "#D9534F")
+
+Color Exposure Rate = IF([Simulated Exposure Rate] < [Loss Rate], "#2E8B57", "#D9534F")
+
+Color Approval Rate = IF([Approval Rate] < 1, "#E69F00", "#2E8B57")
